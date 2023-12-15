@@ -1,172 +1,199 @@
-package new
+package main
 
 import (
-	"bufio"
 	"context"
-	"crypto/rand"
-	"flag"
+	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/libp2p/go-libp2p"
-	"github.com/libp2p/go-libp2p/core/crypto"
-	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
-	"github.com/libp2p/go-libp2p/core/peerstore"
+	peerstore "github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
+	"github.com/multiformats/go-multiaddr"
 )
 
-func makeBasicHost(listenPort int, insecure bool, randseed int64) (host.Host, error) {
-
-	// If the seed is zero, use real cryptographic randomness. Otherwise, use a
-	// deterministic randomness source to make generated keys stay the same
-	// across multiple runs
-	var r io.Reader
-	if randseed == 0 {
-		r = rand.Reader
-	} else {
-		r = mrand.New(mrand.NewSource(randseed))
-	}
-
-	// Generate a key pair for this host. We will use it at least
-	// to obtain a valid host ID.
-	priv, _, err := crypto.GenerateKeyPairWithReader(crypto.RSA, 2048, r)
-	if err != nil {
-		return nil, err
-	}
-
-	opts := []libp2p.Option{
-		libp2p.ListenAddrStrings(fmt.Sprintf("/ip4/127.0.0.1/tcp/%d", listenPort)),
-		libp2p.Identity(priv),
-		libp2p.DisableRelay(),
-	}
-
-	if insecure {
-		opts = append(opts, libp2p.NoSecurity)
-	}
-
-	basicHost, err := libp2p.New(context.Background(), opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Build host multiaddress
-	hostAddr, _ := ma.NewMultiaddr(fmt.Sprintf("/ipfs/%s", basicHost.ID().Pretty()))
-
-	// Now we can build a full multiaddress to reach this host
-	// by encapsulating both addresses:
-	addr := basicHost.Addrs()[0]
-	fullAddr := addr.Encapsulate(hostAddr)
-	log.Printf("I am %s\n", fullAddr)
-	if insecure {
-		log.Printf("Now run \"./echo -l %d -d %s -insecure\" on a different terminal\n", listenPort+1, fullAddr)
-	} else {
-		log.Printf("Now run \"./echo -l %d -d %s\" on a different terminal\n", listenPort+1, fullAddr)
-	}
-
-	return basicHost, nil
-}
+const (
+	counterProtocol = "/counter"
+	fileProtocol    = "/file"
+)
 
 func main() {
-	// LibP2P code uses golog to log messages. They log with different
-	// string IDs (i.e. "swarm"). We can control the verbosity level for
-	// all loggers with:
-	golog.SetAllLoggers(gologging.INFO) // Change to DEBUG for extra info
-
-	// Parse options from the command line
-	listenF := flag.Int("l", 0, "wait for incoming connections")
-	target := flag.String("d", "", "target peer to dial")
-	insecure := flag.Bool("insecure", false, "use an unencrypted connection")
-	seed := flag.Int64("seed", 0, "set random seed for id generation")
-	flag.Parse()
-
-	if *listenF == 0 {
-		log.Fatal("Please provide a port to bind on with -l")
-	}
-
-	// Make a host that listens on the given multiaddress
-	ha, err := makeBasicHost(*listenF, *insecure, *seed)
+	// start a libp2p node that listens on a random local TCP port,
+	// but without running the built-in ping protocol
+	node, err := libp2p.New(
+		libp2p.ListenAddrStrings("/ip4/127.0.0.1/tcp/0"),
+		libp2p.Ping(false),
+	)
 	if err != nil {
-		log.Fatal(err)
+		panic(err)
 	}
 
-	// Set a stream handler on host A. /echo/1.0.0 is
-	// a user-defined protocol name.
-	ha.SetStreamHandler("/echo/1.0.0", func(s network.Stream) {
-		log.Println("Got a new stream!")
-		if err := doEcho(s); err != nil {
-			log.Println(err)
-			s.Reset()
-		} else {
-			s.Close()
+	// configure our own ping protocol
+	pingService := &ping.PingService{Host: node}
+	node.SetStreamHandler(ping.ID, pingService.PingHandler)
+
+	// Register the "/counter" and "/file" protocols
+	node.SetStreamHandler(counterProtocol, handleCounterStream)
+	node.SetStreamHandler(fileProtocol, handleFileStream)
+
+	// print the node's PeerInfo in multiaddr format
+	peerInfo := peerstore.AddrInfo{
+		ID:    node.ID(),
+		Addrs: node.Addrs(),
+	}
+	addrs, err := peerstore.AddrInfoToP2pAddrs(&peerInfo)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println("libp2p node address:", addrs[0])
+
+	// if a remote peer has been passed on the command line, connect to it
+	// and send/receive counter values, otherwise wait for a signal to stop
+	if len(os.Args) > 1 {
+		addr, err := multiaddr.NewMultiaddr(os.Args[1])
+		if err != nil {
+			panic(err)
 		}
-	})
+		peer, err := peerstore.AddrInfoFromP2pAddr(addr)
+		if err != nil {
+			panic(err)
+		}
+		if err := node.Connect(context.Background(), *peer); err != nil {
+			panic(err)
+		}
+		fmt.Println("sending and receiving counter values with", addr)
 
-	if *target == "" {
-		log.Println("listening for connections")
-		select {} // hang forever
-	}
-	/**** This is where the listener code ends ****/
+		// Open a stream to the remote peer with the "/file" protocol
+		fileStream, err := node.NewStream(context.Background(), peer.ID, fileProtocol)
+		if err != nil {
+			panic(err)
+		}
 
-	// The following code extracts target's the peer ID from the
-	// given multiaddress
-	ipfsaddr, err := ma.NewMultiaddr(*target)
-	if err != nil {
-		log.Fatalln(err)
-	}
+		// Run the sendFile function to send a file over the stream
+		go sendFile(fileStream, "./test/file.txt")
 
-	pid, err := ipfsaddr.ValueForProtocol(ma.P_IPFS)
-	if err != nil {
-		log.Fatalln(err)
-	}
+		// Run the writeCounter function to send counter values concurrently
+		go writeCounter(fileStream)
 
-	peerid, err := peer.IDB58Decode(pid)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	// Decapsulate the /ipfs/<peerID> part from the target
-	// /ip4/<a.b.c.d>/ipfs/<peer> becomes /ip4/<a.b.c.d>
-	targetPeerAddr, _ := ma.NewMultiaddr(
-		fmt.Sprintf("/ipfs/%s", peer.IDB58Encode(peerid)))
-	targetAddr := ipfsaddr.Decapsulate(targetPeerAddr)
-
-	// We have a peer ID and a targetAddr so we add it to the peerstore
-	// so LibP2P knows how to contact it
-	ha.Peerstore().AddAddr(peerid, targetAddr, peerstore.PermanentAddrTTL)
-
-	log.Println("opening stream")
-	// make a new stream from host B to host A
-	// it should be handled on host A by the handler we set above because
-	// we use the same /echo/1.0.0 protocol
-	s, err := ha.NewStream(context.Background(), peerid, "/echo/1.0.0")
-	if err != nil {
-		log.Fatalln(err)
+		// ... (existing code)
+	} else {
+		// wait for a SIGINT or SIGTERM signal
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
+		<-ch
+		fmt.Println("Received signal, shutting down...")
 	}
 
-	_, err = s.Write([]byte("Hello, world!\n"))
-	if err != nil {
-		log.Fatalln(err)
+	// shut the node down
+	if err := node.Close(); err != nil {
+		panic(err)
 	}
-
-	out, err := ioutil.ReadAll(s)
-	if err != nil {
-		log.Fatalln(err)
-	}
-
-	log.Printf("read reply: %q\n", out)
 }
 
-// doEcho reads a line of data a stream and writes it back
-func doEcho(s network.Stream) error {
-	buf := bufio.NewReader(s)
-	str, err := buf.ReadString('\n')
+func handleFileStream(stream network.Stream) {
+	fmt.Println("New incoming file stream from", stream.Conn().RemotePeer())
+	// Run the receiveFile function for incoming file streams
+	receiveFile(stream, "received_file.txt")
+}
+
+func sendFile(s network.Stream, filePath string) {
+	file, err := os.Open(filePath)
 	if err != nil {
-		return err
+		panic(err)
+	}
+	defer file.Close()
+
+	// Create a buffer for reading the file in chunks
+	buffer := make([]byte, 1024)
+
+	for {
+		// Read a chunk from the file
+		n, err := file.Read(buffer)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+
+		// Write the chunk to the stream
+		_, err = s.Write(buffer[:n])
+		if err != nil {
+			panic(err)
+		}
 	}
 
-	log.Printf("read: %s\n", str)
-	_, err = s.Write([]byte(str))
-	return err
+	// Close the stream when done
+	err = s.Close()
+	if err != nil {
+		fmt.Println("Error closing stream:", err)
+	}
+}
+
+func receiveFile(s network.Stream, savePath string) {
+	file, err := os.Create(savePath)
+	if err != nil {
+		panic(err)
+	}
+	defer file.Close()
+
+	// Create a buffer for writing received data to the file
+	buffer := make([]byte, 1024)
+
+	for {
+		// Read a chunk from the stream
+		n, err := s.Read(buffer)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			panic(err)
+		}
+
+		// Write the chunk to the file
+		_, err = file.Write(buffer[:n])
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	fmt.Println("File received and saved as", savePath)
+}
+
+func handleCounterStream(stream network.Stream) {
+	fmt.Println("New incoming counter stream from", stream.Conn().RemotePeer())
+	// Run the readCounter function for incoming streams
+	readCounter(stream)
+}
+
+func writeCounter(s network.Stream) {
+	var counter uint64
+
+	for {
+		<-time.After(time.Second)
+		counter++
+
+		// Write the counter value to the stream
+		err := binary.Write(s, binary.BigEndian, counter)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+func readCounter(s network.Stream) {
+	for {
+		var counter uint64
+
+		// Read the counter value from the stream
+		err := binary.Read(s, binary.BigEndian, &counter)
+		if err != nil {
+			panic(err)
+		}
+
+		fmt.Printf("Received %d from %s\n", counter, s.Conn().RemotePeer())
+	}
 }
