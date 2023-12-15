@@ -139,8 +139,6 @@ func writeCounter(s network.Stream) {
 	}
 }
 
-// ... (unchanged code)
-
 func readCounter(s network.Stream) {
 	peerAddr := s.Conn().RemoteMultiaddr().String()
 	peerAddr = sanitizeAddress(peerAddr) // Sanitize the address for folder name
@@ -195,5 +193,3 @@ func sanitizeAddress(address string) string {
 	re := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 	return re.ReplaceAllString(address, "_")
 }
-
-// ... (unchanged code)
