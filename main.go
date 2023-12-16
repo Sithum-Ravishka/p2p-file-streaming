@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"os/signal"
 	"regexp"
 	"syscall"
 	"time"
 
+	"github.com/iden3/go-merkletree-sql"
+	"github.com/iden3/go-merkletree-sql/db/memory"
 	"github.com/libp2p/go-libp2p"
 	"github.com/libp2p/go-libp2p/core/network"
 	peerstore "github.com/libp2p/go-libp2p/core/peer"
@@ -20,11 +23,15 @@ import (
 )
 
 const (
-	counterProtocol = "/counter"
-	dataFilePath    = "./test/text.png"
+	counterProtocol   = "/counter"
+	dataFilePath      = "./test/text.png"
+	signalEndOfFile   = uint64(0)
+	merkleTreeLevels  = 32
+	sleepDurationSecs = 1
 )
 
 func main() {
+
 	// start a libp2p node that listens on a random local TCP port,
 	// but without running the built-in ping protocol
 	node, err := libp2p.New(
@@ -90,6 +97,7 @@ func main() {
 	if err := node.Close(); err != nil {
 		panic(err)
 	}
+
 }
 
 func handleCounterStream(stream network.Stream) {
@@ -98,8 +106,6 @@ func handleCounterStream(stream network.Stream) {
 	readCounter(stream)
 }
 
-const signalEndOfFile = uint64(0)
-
 func writeCounter(s network.Stream) {
 	file, err := os.Open(dataFilePath)
 	if err != nil {
@@ -107,7 +113,12 @@ func writeCounter(s network.Stream) {
 	}
 	defer file.Close()
 
-	buffer := make([]byte, 1024)
+	buffer := make([]byte, 90240)
+
+	// Initialize Merkle Tree
+	ctx := context.Background()
+	store := memory.NewMemoryStorage()
+	mt, _ := merkletree.NewMerkleTree(ctx, store, merkleTreeLevels)
 
 	for {
 		n, err := file.Read(buffer)
@@ -134,9 +145,22 @@ func writeCounter(s network.Stream) {
 			panic(err)
 		}
 
-		// Sleep for a while (you may adjust the duration)
-		time.Sleep(time.Second)
+		// Convert the buffer to a big.Int before adding it to the Merkle Tree
+		dataAsBigInt := new(big.Int).SetBytes(buffer[:n])
+		index := big.NewInt(int64(n))
+		mt.Add(ctx, index, dataAsBigInt)
+
+		// Sleep for a while
+		time.Sleep(time.Second * sleepDurationSecs)
 	}
+
+	// Generate proof for the root of the Merkle Tree
+	root := mt.Root()
+	proofExist, _, _ := mt.GenerateProof(ctx, big.NewInt(0), root)
+
+	// Print Merkle Tree proof information
+	fmt.Println("Merkle Tree Root:", root)
+	fmt.Println("Proof of membership:", proofExist.Existence)
 }
 
 func readCounter(s network.Stream) {
@@ -176,19 +200,16 @@ func readCounter(s network.Stream) {
 			panic(err)
 		}
 
-		// Save the file data to a file in the peer's folder
 		filePath := fmt.Sprintf("%s/chunk_%d.txt", peerAddr, time.Now().UnixNano())
 		err = ioutil.WriteFile(filePath, buffer, 0644)
 		if err != nil {
 			panic(err)
 		}
 
-		// Print the path to the saved file
 		fmt.Printf("Saved chunk to: %s\n", filePath)
 	}
 }
 
-// SanitizeAddress replaces non-alphanumeric characters with underscores
 func sanitizeAddress(address string) string {
 	re := regexp.MustCompile(`[^a-zA-Z0-9]+`)
 	return re.ReplaceAllString(address, "_")

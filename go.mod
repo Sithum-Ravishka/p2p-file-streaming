@@ -7,6 +7,8 @@ require (
 	github.com/multiformats/go-multiaddr v0.12.0
 )
 
+require github.com/iden3/go-iden3-crypto v0.0.13 // indirect
+
 require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -27,6 +29,7 @@ require (
 	github.com/google/pprof v0.0.0-20231023181126-ff6d637d2a7b // indirect
 	github.com/gorilla/websocket v1.5.0 // indirect
 	github.com/huin/goupnp v1.3.0 // indirect
+	github.com/iden3/go-merkletree-sql v1.0.2
 	github.com/ipfs/go-cid v0.4.1 // indirect
 	github.com/ipfs/go-log/v2 v2.5.1 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
