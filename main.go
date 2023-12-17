@@ -16,6 +16,7 @@ import (
 	"github.com/iden3/go-merkletree-sql"
 	"github.com/iden3/go-merkletree-sql/db/memory"
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	peerstore "github.com/libp2p/go-libp2p/core/peer"
 	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
@@ -28,6 +29,8 @@ const (
 	signalEndOfFile   = uint64(0)
 	merkleTreeLevels  = 32
 	sleepDurationSecs = 1
+	// New custom protocol for broadcasting file shares and connected peers
+	broadcastProtocol = "/broadcast"
 )
 
 func main() {
@@ -41,6 +44,9 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
+	// Register the "/broadcast" protocol for broadcasting file shares and connected peers
+	node.SetStreamHandler(broadcastProtocol, handleBroadcastStream)
 
 	// configure our own ping protocol
 	pingService := &ping.PingService{Host: node}
@@ -84,6 +90,9 @@ func main() {
 
 		// Run the writeCounter and readCounter functions concurrently
 		go writeCounter(stream)
+
+		// Run the broadcast function concurrently to inform other peers about the new connection
+		go broadcastConnectedPeer(node, addr)
 		readCounter(stream)
 	} else {
 		// wait for a SIGINT or SIGTERM signal
@@ -98,6 +107,43 @@ func main() {
 		panic(err)
 	}
 
+}
+
+// Function to broadcast information about the new connected peer to all peers
+func broadcastConnectedPeer(node host.Host, addr multiaddr.Multiaddr) {
+	// Get the list of all connected peers
+	peers := node.Network().Peers()
+
+	// Iterate over all connected peers and send broadcast messages
+	for _, peer := range peers {
+		if peer == node.ID() {
+			continue // Skip broadcasting to itself
+		}
+
+		// Open a stream to the remote peer with the "/broadcast" protocol
+		stream, err := node.NewStream(context.Background(), peer, broadcastProtocol)
+		if err != nil {
+			fmt.Println("Error opening broadcast stream to peer", peer, ":", err)
+			continue
+		}
+
+		// Send information about the new connected peer
+		fmt.Fprintf(stream, "New peer connected: %s\n", addr.String())
+		stream.Close()
+	}
+}
+
+// Function to handle the "/broadcast" protocol stream
+func handleBroadcastStream(stream network.Stream) {
+	defer stream.Close()
+
+	// Read and print the broadcast message
+	data, err := ioutil.ReadAll(stream)
+	if err != nil {
+		fmt.Println("Error reading broadcast message:", err)
+		return
+	}
+	fmt.Println("Broadcast message received:", string(data))
 }
 
 func handleCounterStream(stream network.Stream) {
